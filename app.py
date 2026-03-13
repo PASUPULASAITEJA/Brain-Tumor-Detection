@@ -46,8 +46,8 @@ def load_model() -> tf.keras.Model:
 
 
 def preprocess_for_model(image: Image.Image) -> np.ndarray:
-    img = image.convert("RGB").resize((150, 150))
-    arr = np.array(img, dtype=np.float32) / 255.0
+    img = image.convert("RGB").resize((224, 224))
+    arr = np.array(img, dtype=np.float32)
     return np.expand_dims(arr, axis=0)
 
 
