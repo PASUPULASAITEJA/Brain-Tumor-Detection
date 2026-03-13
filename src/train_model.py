@@ -38,27 +38,11 @@ def create_model() -> tf.keras.Model:
     ], name='data_augmentation')
 
     model = Sequential([
-<<<<<<< HEAD:train_model.py
         tf.keras.layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3)),
         data_augmentation,
         tf.keras.layers.Rescaling(1./127.5, offset=-1), 
         base_model,
         GlobalAveragePooling2D(),
-=======
-        Input(shape=(IMG_SIZE, IMG_SIZE, 3)),
-
-        Conv2D(16, (3,3), activation='relu'),
-        MaxPooling2D(2,2),
-
-        Conv2D(32, (3,3), activation='relu'),
-        MaxPooling2D(2,2),
-
-        Conv2D(64, (3,3), activation='relu'),
-        MaxPooling2D(2,2),
-
-        Flatten(),
-        Dense(64, activation='relu'),
->>>>>>> 62ea4b18e2a8fd4cbfaacbab913ba041dc10c850:src/train_model.py
         Dropout(0.5),
         Dense(1, activation='sigmoid')
     ])
@@ -106,12 +90,9 @@ def train() -> None:
         class_weight=class_weights, callbacks=callbacks
     )
     print(f"✅ Model saved to {MODEL_PATH}")
-<<<<<<< HEAD:train_model.py
     print("\nEvaluating model on isolated test set...")
     loss, accuracy = model.evaluate(test_ds)
     print(f"Test Accuracy: {accuracy*100:.2f}%\n")
-=======
->>>>>>> 62ea4b18e2a8fd4cbfaacbab913ba041dc10c850:src/train_model.py
 
 if __name__ == '__main__':
     train()
