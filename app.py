@@ -41,7 +41,7 @@ st.write("Upload an MRI scan to check whether a brain tumor is present.")
 # ══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_resource
-def load_model():
+def load_model() -> tf.keras.Model:
     return tf.keras.models.load_model("model/brain_tumor_model.h5")
 
 
@@ -204,7 +204,6 @@ uploaded_file = st.file_uploader(
 )
 
 if uploaded_file is not None:
-
     try:
         image = Image.open(uploaded_file)
     except Exception:
