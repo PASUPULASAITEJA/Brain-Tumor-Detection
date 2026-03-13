@@ -6,15 +6,9 @@ from tensorflow.keras.layers import Dense, Dropout, GlobalAveragePooling2D, Rand
 from tensorflow.keras.applications import MobileNetV2
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 
-<<<<<<< HEAD:train_model.py
 IMG_SIZE = 224
 BATCH_SIZE = 16
 EPOCHS = 15
-=======
-IMG_SIZE = 150
-BATCH_SIZE = 2
-EPOCHS = 20
->>>>>>> 62ea4b18e2a8fd4cbfaacbab913ba041dc10c850:src/train_model.py
 DATASET_PATH = 'dataset'
 MODEL_PATH = 'model/brain_tumor_model.h5'
 
