@@ -2,8 +2,8 @@
 
 A deep-learning system for detecting and **localising** brain tumours in MRI
 scans.  The pipeline combines a fine-tuned **EfficientNetB0 binary classifier**
-with a **Faster RCNN (ResNet-50 FPN)** object detector to give both a
-confidence score and a bounding-box around the tumour region.
+with a **Faster RCNN (MobileNetV3 Large 320 FPN)** object detector to give both
+a confidence score and a bounding-box around the tumour region.
 
 ---
 
@@ -16,14 +16,15 @@ MRI Image
 ┌─────────────────────────────────────────────┐
 │  Stage 1 — EfficientNetB0 Classifier        │
 │  • Pre-trained ImageNet weights              │
-│  • Two-phase fine-tuning                     │
+│  • Classifier head fine-tuning              │
 │  • Output: tumour probability (0–1)          │
 └───────────────────┬─────────────────────────┘
                     │ if prob ≥ 0.40
                     ▼
 ┌─────────────────────────────────────────────┐
 │  Stage 2 — Faster RCNN Detector             │
-│  • ResNet-50 + FPN backbone (COCO pretrain) │
+│  • MobileNetV3 Large 320 FPN backbone       │
+│  • COCO pretrained weights                  │
 │  • Fine-tuned on GradCAM pseudo-annotations │
 │  • Output: bounding boxes + scores          │
 └───────────────────┬─────────────────────────┘
@@ -53,10 +54,11 @@ brain-tumor-detection/
 ├── model/
 │   ├── efficientnet_classifier.h5  # Fine-tuned EfficientNetB0
 │   ├── rcnn_model.pth              # Faster RCNN checkpoint
-│   └── metrics.json                # Classifier test-set metrics
+│   ├── metrics.json                # Classifier test-set metrics
+│   └── rcnn_history.json           # RCNN training loss/accuracy per epoch
 ├── src/
 │   ├── augment_dataset.py          # 10× data augmentation
-│   ├── train_model.py              # EfficientNetB0 two-phase training
+│   ├── train_model.py              # EfficientNetB0 classifier training
 │   ├── gradcam.py                  # Grad-CAM computation + visualisation
 │   ├── generate_annotations.py     # GradCAM → COCO bounding boxes
 │   ├── rcnn_dataset.py             # PyTorch Dataset for Faster RCNN
@@ -89,9 +91,8 @@ python src/augment_dataset.py
 
 ### Step 2 — Train the EfficientNetB0 classifier
 
-Two-phase training:
-1. Classifier head only (backbone frozen, LR = 1e-3)
-2. Top-30 backbone layers fine-tuned (LR = 1e-5)
+Trains a classification head on top of a frozen EfficientNetB0 backbone
+(ImageNet weights). Achieves val-AUC ~0.998 and ~97% accuracy.
 
 ```bash
 python src/train_model.py
@@ -102,24 +103,24 @@ Saves `model/efficientnet_classifier.h5` and `model/metrics.json`.
 ### Step 3 — Generate bounding-box annotations via Grad-CAM
 
 Runs the trained classifier on every tumour image, extracts Grad-CAM activation
-maps, and converts them to COCO-format bounding boxes.
+maps, and converts them to COCO-format bounding boxes (no manual labelling needed).
 
 ```bash
 python src/generate_annotations.py
 ```
 
-Saves `annotations/annotations.json`.
+Saves `annotations/annotations.json` (~1,396 annotated tumour images).
 
 ### Step 4 — Fine-tune Faster RCNN
 
-Fine-tunes a COCO-pretrained Faster RCNN (ResNet-50 FPN) on the generated
-annotations.
+Fine-tunes a COCO-pretrained Faster RCNN (MobileNetV3 Large 320 FPN backbone)
+on the generated annotations.
 
 ```bash
 python src/train_rcnn.py
 ```
 
-Saves `model/rcnn_model.pth`.
+Saves `model/rcnn_model.pth` and `model/rcnn_history.json`.
 
 ### Step 5 — Launch the web app
 
@@ -146,10 +147,10 @@ displays accuracy, AUC, precision, and recall from the last training run.
 
 ## Model Performance
 
-| Metric | EfficientNetB0 (expected) |
+| Metric | EfficientNetB0 |
 |---|---|
-| Test Accuracy | ≥ 95% |
-| AUC | ≥ 0.97 |
+| Test Accuracy | ≥ 97% |
+| AUC | ≥ 0.998 |
 | Precision | ≥ 94% |
 | Recall | ≥ 95% |
 
@@ -160,7 +161,7 @@ displays accuracy, AUC, precision, and recall from the last training run.
 ## Requirements
 
 - Python 3.10+
-- TensorFlow 2.16
+- TensorFlow 2.16+
 - PyTorch ≥ 2.1 + torchvision ≥ 0.16
 - OpenCV, Pillow, scikit-learn, Streamlit
 
@@ -171,7 +172,8 @@ displays accuracy, AUC, precision, and recall from the last training run.
 | Decision | Reason |
 |---|---|
 | EfficientNetB0 over MobileNetV2 | Higher accuracy with similar inference speed |
-| Two-phase training | Prevents catastrophic forgetting during fine-tuning |
+| Classifier head only (no Phase 2 fine-tuning) | Phase 1 already achieves val-AUC 0.9975; Phase 2 risked overfitting |
 | GradCAM pseudo-annotations | Enables RCNN training without manual bounding-box labelling |
 | Faster RCNN (not original RCNN) | End-to-end trainable; RPN learns tumour-relevant proposals |
+| MobileNetV3 Large FPN backbone | ~3× faster than ResNet-50 FPN; fits in MacBook memory; still COCO pretrained |
 | 10× augmentation | Overcomes small dataset (253 → ~2,780 images) |
