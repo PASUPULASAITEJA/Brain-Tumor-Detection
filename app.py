@@ -1,284 +1,353 @@
 """
 Brain Tumor Detection — Streamlit App
 ======================================
-Segmentation pipeline (pure OpenCV):
+Detection pipeline (priority order):
 
-  1.  Grayscale + Gaussian blur (7×7)
-  2.  DUAL-MODE adaptive threshold:
-        • Normal MRI  → p90 of non-black pixels
-        • Saturated   → mean + 0.60×std
-  3.  Morphological OPENING  (3×3, 1 iter)  + CLOSING (9×9, 3 iters)
-  4.  Connected-component analysis
-  5.  Hard-reject: border-touching, <0.3%, >25% area
-  6.  Quality filters  ← KEY FALSE-POSITIVE SUPPRESSOR
-        • compactness  >= 0.40  (tumors are round; vessels/folds are elongated)
-        • mean_intensity >= 120  (tumors are hyper-intense on T2/FLAIR)
-  7.  Score: intensity (60%) + compactness (25%) + area-fitness (15%)
-  8.  Semi-transparent red fill + 2-px contour outline
+  1. EfficientNetB0 binary classifier  →  tumour probability score
+  2. Faster RCNN detector              →  bounding-box localisation (if model exists)
+  3. Grad-CAM attention map            →  fallback localisation
+  4. OpenCV morphological segmentation →  independent visual verification
 
 CNN confidence tiers:
-  >= 0.70  →  🔴  High confidence — Tumor Detected
-  >= 0.50  →  🟠  Moderate confidence — Possible Tumor
-  >= 0.40  →  🟡  Low confidence — Inconclusive
-  <  0.40  →  🟢  No Tumor Detected
+  ≥ 0.70  →  🔴  High confidence  — Tumour Detected
+  ≥ 0.50  →  🟠  Moderate         — Possible Tumour
+  ≥ 0.40  →  🟡  Borderline       — Inconclusive
+  < 0.40  →  🟢  No Tumour Detected
 """
 
+import os
+import sys
+
 import streamlit as st
-import tensorflow as tf
 import numpy as np
 import cv2
 from PIL import Image
 
-# ─────────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Brain Tumor Detection",
-                   page_icon="🧠", layout="centered")
+# ── make src/ importable ──────────────────────────────────────────────────────
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
+
+import tensorflow as tf
+from tensorflow.keras.applications.efficientnet import preprocess_input as _eff_preprocess
+
+class EfficientNetPreprocess(tf.keras.layers.Layer):
+    def call(self, x):
+        return _eff_preprocess(x)
+    def get_config(self):
+        return super().get_config()
+
+# Faster RCNN (optional — requires PyTorch + trained model)
+try:
+    from rcnn_detector import load_rcnn_model, detect_tumor, draw_detections
+    _TORCH_OK = True
+except ImportError:
+    _TORCH_OK = False
+
+# Grad-CAM (optional — requires trained EfficientNet model)
+try:
+    from gradcam import get_gradcam, heatmap_to_bbox, overlay_gradcam
+    _GRADCAM_OK = True
+except ImportError:
+    _GRADCAM_OK = False
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Page config
+# ──────────────────────────────────────────────────────────────────────────────
+
+st.set_page_config(
+    page_title="Brain Tumor Detection (RCNN)",
+    page_icon="🧠",
+    layout="wide",
+)
+
 st.title("🧠 Brain Tumor Detection")
-st.write("Upload an MRI scan to check whether a brain tumor is present.")
+st.caption(
+    "Powered by **EfficientNetB0 classifier** + **Faster RCNN detector** "
+    "with Grad-CAM attention visualisation."
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Model paths
+# ──────────────────────────────────────────────────────────────────────────────
+
+CLASSIFIER_PATH  = "model/efficientnet_classifier.h5"
+LEGACY_PATH      = "model/brain_tumor_model.h5"          # old MobileNetV2
+RCNN_PATH        = "model/rcnn_model.pth"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  MODEL HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
+#  Cached model loaders
+# ──────────────────────────────────────────────────────────────────────────────
 
-@st.cache_resource
-def load_model() -> tf.keras.Model:
-    return tf.keras.models.load_model("model/brain_tumor_model.h5")
+@st.cache_resource(show_spinner="Loading classifier…")
+def _load_classifier() -> "tf.keras.Model | None":
+    for path in (CLASSIFIER_PATH, LEGACY_PATH):
+        if os.path.exists(path):
+            return tf.keras.models.load_model(
+                path, compile=False,
+                custom_objects={"EfficientNetPreprocess": EfficientNetPreprocess}
+            )
+    return None
 
 
-def preprocess_for_model(image: Image.Image) -> np.ndarray:
-    img = image.convert("RGB").resize((224, 224))
-    arr = np.array(img, dtype=np.float32)
-    return np.expand_dims(arr, axis=0)
+@st.cache_resource(show_spinner="Loading Faster RCNN…")
+def _load_rcnn():
+    if not _TORCH_OK:
+        return None
+    return load_rcnn_model(RCNN_PATH)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  THRESHOLD HELPER
-# ══════════════════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
+#  Preprocessing
+# ──────────────────────────────────────────────────────────────────────────────
 
-def compute_threshold(blurred: np.ndarray) -> float:
-    """
-    Dual-mode adaptive threshold:
-      Mode A (normal):    90th-percentile of non-black pixels
-      Mode B (saturated): mean + 0.60×std  (when p90 ≥ 250)
-    """
+def preprocess(image: Image.Image, size: int = 224) -> np.ndarray:
+    """Return (1, size, size, 3) float32 array in [0, 255]."""
+    img = image.convert("RGB").resize((size, size))
+    return np.expand_dims(np.array(img, dtype=np.float32), 0)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  OpenCV morphological segmentation (fallback)
+# ──────────────────────────────────────────────────────────────────────────────
+
+MIN_COMPACTNESS = 0.40
+MIN_INTENSITY   = 120
+
+
+def _compute_threshold(blurred: np.ndarray) -> float:
     non_black = blurred[blurred > 10]
     if non_black.size == 0:
         return float(blurred.mean())
     t90 = float(np.percentile(non_black, 90))
-    if t90 >= 250:
-        return float(blurred.mean() + 0.60 * blurred.std())
-    return t90
+    return float(blurred.mean() + 0.60 * blurred.std()) if t90 >= 250 else t90
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  TUMOR SEGMENTATION
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Minimum quality thresholds — validated against real tumor and no-tumor scans:
-#   Real tumors:      compactness 0.73–0.84,  mean brightness 196–221
-#   False positives:  compactness 0.19–0.25,  mean brightness  89–110
-MIN_COMPACTNESS = 0.40   # below this → elongated vessel / fold, not a tumor
-MIN_INTENSITY   = 120    # below this → not hyper-intense enough to be a tumor
-
-
-def segment_tumor(original_image: Image.Image):
+def segment_tumor_opencv(image: Image.Image):
     """
-    Returns
-    -------
-    result_rgb : np.ndarray  — image with red overlay (or original if not found)
-    found      : bool
-    info       : dict
+    Pure-OpenCV morphological tumour segmentation (independent of CNN).
+
+    Returns (result_rgb, found, info_dict)
     """
-    img_rgb    = np.array(original_image.convert("RGB"))
+    img_rgb    = np.array(image.convert("RGB"))
     h, w       = img_rgb.shape[:2]
     image_area = h * w
 
     gray    = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
     blurred = cv2.GaussianBlur(gray, (7, 7), 0)
 
-    # ── Threshold ─────────────────────────────────────────────────────────────
-    thresh      = compute_threshold(blurred)
-    bright_mask = np.zeros((h, w), dtype=np.uint8)
-    bright_mask[blurred > thresh] = 255
+    thresh      = _compute_threshold(blurred)
+    mask        = np.zeros((h, w), dtype=np.uint8)
+    mask[blurred > thresh] = 255
 
-    # ── Morphological filtering ───────────────────────────────────────────────
     k_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    opened  = cv2.morphologyEx(bright_mask, cv2.MORPH_OPEN,  k_open,  iterations=1)
     k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    closed  = cv2.morphologyEx(opened,     cv2.MORPH_CLOSE, k_close, iterations=3)
+    opened  = cv2.morphologyEx(mask,   cv2.MORPH_OPEN,  k_open,  iterations=1)
+    closed  = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, k_close, iterations=3)
 
-    # ── Connected-component analysis ──────────────────────────────────────────
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+    n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
         closed, connectivity=8
     )
-    if num_labels < 2:
+    if n_labels < 2:
         return img_rgb.copy(), False, {}
 
-    # ── Candidate filtering ───────────────────────────────────────────────────
     border_margin = max(5, int(min(h, w) * 0.02))
     candidates    = []
 
-    for i in range(1, num_labels):
+    for i in range(1, n_labels):
         area = int(stats[i, cv2.CC_STAT_AREA])
         x0   = int(stats[i, cv2.CC_STAT_LEFT])
         y0   = int(stats[i, cv2.CC_STAT_TOP])
-        bw   = int(stats[i, cv2.CC_STAT_WIDTH])
+        bw_  = int(stats[i, cv2.CC_STAT_WIDTH])
         bh_  = int(stats[i, cv2.CC_STAT_HEIGHT])
 
-        # Hard area filter
         if area < image_area * 0.003:  continue
         if area > image_area * 0.25:   continue
-
-        # Border filter (skull rim / artefacts)
-        if x0         <= border_margin:       continue
-        if y0         <= border_margin:       continue
-        if (x0 + bw)  >= (w - border_margin): continue
-        if (y0 + bh_) >= (h - border_margin): continue
+        if x0         <= border_margin:             continue
+        if y0         <= border_margin:             continue
+        if (x0 + bw_) >= (w - border_margin):       continue
+        if (y0 + bh_) >= (h - border_margin):       continue
 
         blob_mask = (labels == i).astype(np.uint8)
         mean_int  = float(np.mean(gray[blob_mask > 0]))
 
-        blob_u8 = blob_mask * 255
-        cnts, _ = cv2.findContours(blob_u8, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
+        cnts, _ = cv2.findContours(blob_mask * 255,
+                                   cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         compact = 0.0
         if cnts:
             perim = cv2.arcLength(cnts[0], True)
             if perim > 0:
                 compact = (4.0 * np.pi * area) / (perim ** 2)
 
-        # ── Quality filter: suppresses false positives ────────────────────────
-        # Vessels, cortical folds, and scan artefacts are elongated (low
-        # compactness) and dimmer than true hyper-intense tumors.
-        if compact  < MIN_COMPACTNESS:  continue
-        if mean_int < MIN_INTENSITY:    continue
+        if compact  < MIN_COMPACTNESS: continue
+        if mean_int < MIN_INTENSITY:   continue
 
         area_pct     = area / image_area
         area_fitness = max(0.0, 1.0 - abs(area_pct - 0.05) / 0.10)
         score        = mean_int * 0.60 + compact * 100 * 0.25 + area_fitness * 100 * 0.15
 
-        candidates.append({
-            "mask":      blob_mask,
-            "contours":  cnts,
-            "score":     score,
-            "area":      area,
-            "intensity": mean_int,
-            "compact":   compact,
-            "centroid":  centroids[i],
-        })
+        candidates.append(dict(
+            mask=blob_mask, contours=cnts, score=score,
+            area=area, intensity=mean_int, compact=compact,
+            centroid=centroids[i],
+        ))
 
     if not candidates:
         return img_rgb.copy(), False, {}
 
-    # ── Best candidate ────────────────────────────────────────────────────────
-    best             = max(candidates, key=lambda c: c["score"])
-    (cx, cy), radius = cv2.minEnclosingCircle(best["contours"][0])
+    best       = max(candidates, key=lambda c: c["score"])
+    (cx, cy), _ = cv2.minEnclosingCircle(best["contours"][0])
 
-    # ── Red overlay ───────────────────────────────────────────────────────────
     result  = img_rgb.copy()
-    alpha   = 0.50
     m3d     = np.stack([best["mask"]] * 3, axis=-1).astype(np.float32)
     red_lyr = np.zeros_like(result, dtype=np.float32)
     red_lyr[..., 0] = 255
-    blended = (result.astype(np.float32) * (1.0 - alpha * m3d)
-               + red_lyr * (alpha * m3d))
+    blended = result.astype(np.float32) * (1.0 - 0.50 * m3d) + red_lyr * (0.50 * m3d)
     result  = np.clip(blended, 0, 255).astype(np.uint8)
     cv2.drawContours(result, best["contours"], -1, (255, 30, 30), 2)
 
     info = {
-        "center":    (int(cx), int(cy)),
-        "radius":    int(radius),
-        "area_pct":  round(best["area"] / image_area * 100, 2),
+        "center":   (int(cx), int(cy)),
+        "area_pct": round(best["area"] / image_area * 100, 2),
         "intensity": round(best["intensity"], 1),
-        "compact":   round(best["compact"], 3),
+        "compact":  round(best["compact"], 3),
     }
     return result, True, info
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  STREAMLIT UI
-# ══════════════════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
+#  UI
+# ──────────────────────────────────────────────────────────────────────────────
 
-uploaded_file = st.file_uploader(
-    "Upload MRI Image", type=["jpg", "jpeg", "png"]
+with st.sidebar:
+    st.header("Model Status")
+    clf_model  = _load_classifier()
+    rcnn_model = _load_rcnn()
+
+    st.write("**Classifier**",
+             "✅ EfficientNetB0" if (clf_model and CLASSIFIER_PATH in str(type(clf_model)))
+             else ("✅ MobileNetV2 (legacy)" if clf_model else "❌ Not found"))
+    st.write("**Faster RCNN**",
+             "✅ Ready" if rcnn_model else
+             ("⚠️ PyTorch not installed" if not _TORCH_OK else "⚠️ Not trained yet"))
+    st.write("**Grad-CAM**", "✅ Available" if _GRADCAM_OK else "⚠️ Unavailable")
+    st.markdown("---")
+    st.caption("Training pipeline:\n"
+               "1. `python src/augment_dataset.py`\n"
+               "2. `python src/train_model.py`\n"
+               "3. `python src/generate_annotations.py`\n"
+               "4. `python src/train_rcnn.py`")
+
+uploaded = st.file_uploader(
+    "Upload an MRI scan (JPG / PNG)", type=["jpg", "jpeg", "png"]
 )
 
-if uploaded_file is not None:
-    try:
-        image = Image.open(uploaded_file)
-    except Exception:
-        st.error("❌ Invalid image file.")
-        st.stop()
+if uploaded is None:
+    st.info("👆 Upload a brain MRI image to start detection.")
+    st.stop()
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.image(image, caption="Original MRI", width=300)
+try:
+    image = Image.open(uploaded)
+except Exception:
+    st.error("❌ Could not open image file.")
+    st.stop()
 
-    with st.spinner("Analysing MRI scan…"):
+if clf_model is None:
+    st.error("❌ No classifier model found. Run `python src/train_model.py` first.")
+    st.stop()
 
-        try:
-            model = load_model()
-        except Exception:
-            st.error("❌ Model file not found. Please run train_model.py first.")
-            st.stop()
+# ── Layout ────────────────────────────────────────────────────────────────────
+col_orig, col_rcnn, col_cam = st.columns(3)
+with col_orig:
+    st.image(image, caption="Original MRI", use_container_width=True)
 
-        arr        = preprocess_for_model(image)
-        prediction = float(model.predict(arr, verbose=0)[0][0])
+with st.spinner("Analysing scan…"):
 
-        # ── Confidence-tiered response ─────────────────────────────────────────
-        if prediction >= 0.40:
+    arr  = preprocess(image)
+    pred = float(clf_model.predict(arr, verbose=0)[0][0])
 
-            overlay, seg_found, info = segment_tumor(image)
+    # ── Confidence tier banner ─────────────────────────────────────────────────
+    if pred >= 0.70:
+        st.error(f"🔴 **Tumour Detected** — Classifier confidence: {pred*100:.1f}%")
+    elif pred >= 0.50:
+        st.warning(f"🟠 **Possible Tumour** — Confidence: {pred*100:.1f}%  "
+                   f"_(Clinical review recommended)_")
+    elif pred >= 0.40:
+        st.info(f"🟡 **Borderline** — Confidence: {pred*100:.1f}%  "
+                f"_(Inconclusive — consider follow-up scan)_")
+    else:
+        confidence_no = (1.0 - pred) * 100
+        st.success(f"🟢 **No Tumour Detected** — Confidence: {confidence_no:.1f}%")
 
-            # ── Tier 1: High confidence (≥70%) ────────────────────────────────
-            if prediction >= 0.70:
-                st.error(f"🔴 Tumor Detected  —  Confidence: {prediction*100:.1f}%")
-
-            # ── Tier 2: Moderate confidence (50–70%) ──────────────────────────
-            elif prediction >= 0.50:
-                st.warning(f"🟠 Possible Tumor  —  Confidence: {prediction*100:.1f}%  "
-                           f"_(Recommend clinical review)_")
-
-            # ── Tier 3: Low / borderline (40–50%) ─────────────────────────────
+    # ── Faster RCNN detection ──────────────────────────────────────────────────
+    if rcnn_model is not None and pred >= 0.40:
+        result = detect_tumor(rcnn_model, image)
+        rcnn_vis = draw_detections(image, result)
+        with col_rcnn:
+            st.image(rcnn_vis, caption="Faster RCNN Detection", use_container_width=True)
+            if result["detected"]:
+                st.caption(
+                    f"📦 {len(result['boxes'])} region(s) found  |  "
+                    f"Best score: {result['best_score']*100:.1f}%"
+                )
             else:
-                # If segmentation also found nothing → likely a false positive
-                if not seg_found:
-                    st.info(f"🟡 Inconclusive  —  Model confidence: {prediction*100:.1f}%  "
-                            f"_(No distinct tumor region found — likely normal)_")
-                else:
-                    st.warning(f"🟠 Low-confidence detection  —  Confidence: {prediction*100:.1f}%  "
-                               f"_(Please consult a radiologist)_")
+                st.caption("RCNN: no high-confidence tumour region")
+    elif pred >= 0.40:
+        with col_rcnn:
+            st.image(image, caption="RCNN not available", use_container_width=True)
+            st.caption("Train the RCNN model to enable bounding-box detection.")
 
-            # ── Display segmentation result ────────────────────────────────────
-            with col2:
+    # ── Grad-CAM / fallback visualisation ─────────────────────────────────────
+    if _GRADCAM_OK:
+        try:
+            heatmap   = get_gradcam(clf_model, arr)
+            cam_vis   = overlay_gradcam(np.array(image.convert("RGB")), heatmap)
+            with col_cam:
+                st.image(cam_vis, caption="Grad-CAM Attention Map",
+                         use_container_width=True)
+
+            # If RCNN not available and pred is positive, show bbox from GradCAM
+            if (rcnn_model is None or not _TORCH_OK) and pred >= 0.50:
+                bbox = heatmap_to_bbox(heatmap,
+                                       (image.height, image.width),
+                                       threshold=0.40)
+                if bbox:
+                    img_arr = np.array(image.convert("RGB"))
+                    x1, y1, x2, y2 = bbox
+                    cv2.rectangle(img_arr, (x1, y1), (x2, y2), (255, 60, 60), 2)
+                    st.image(img_arr, caption="Grad-CAM Localisation",
+                             use_container_width=True)
+        except Exception:
+            with col_cam:
+                st.image(image, caption="Grad-CAM unavailable",
+                         use_container_width=True)
+    else:
+        # OpenCV segmentation as pure fallback
+        if pred >= 0.40:
+            seg_vis, seg_found, seg_info = segment_tumor_opencv(image)
+            with col_cam:
+                st.image(seg_vis,
+                         caption="OpenCV Segmentation" if seg_found
+                         else "No distinct region found",
+                         use_container_width=True)
                 if seg_found:
-                    st.image(overlay,
-                             caption="Tumor Region Highlighted (Red)",
-                             width=300)
-                    cx_pct = info["center"][0] / image.width  * 100
-                    cy_pct = info["center"][1] / image.height * 100
+                    cx_pct = seg_info["center"][0] / image.width  * 100
+                    cy_pct = seg_info["center"][1] / image.height * 100
                     st.caption(
                         f"📍 Centre ≈ ({cx_pct:.0f}%, {cy_pct:.0f}%)  |  "
-                        f"Area ≈ {info['area_pct']}%  |  "
-                        f"Brightness: {info['intensity']}  |  "
-                        f"Compactness: {info['compact']}"
+                        f"Area ≈ {seg_info['area_pct']}%  |  "
+                        f"Brightness: {seg_info['intensity']}  |  "
+                        f"Compactness: {seg_info['compact']}"
                     )
-                else:
-                    st.image(image,
-                             caption="No distinct tumor region isolated",
-                             width=300)
-                    if prediction >= 0.50:
-                        st.caption(
-                            "⚠️ Model flagged this scan but no compact bright "
-                            "region was found. Tumor may be diffuse or isointense."
-                        )
 
-        else:
-            # ── No tumor ──────────────────────────────────────────────────────
-            confidence = 1.0 - prediction
-            st.success(f"🟢 No Tumor Detected  —  Confidence: {confidence*100:.1f}%")
-            with col2:
-                st.image(image, caption="No Tumor Detected", width=300)
-
-else:
-    st.info("👆 Please upload an MRI image to start detection.")
+# ── Metrics panel ─────────────────────────────────────────────────────────────
+metrics_path = "model/metrics.json"
+if os.path.exists(metrics_path):
+    import json
+    with open(metrics_path) as f:
+        m = json.load(f)
+    with st.expander("📊 Classifier Training Metrics"):
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Accuracy",  f"{m.get('accuracy', 0)*100:.1f}%")
+        c2.metric("AUC",       f"{m.get('auc', 0):.4f}")
+        c3.metric("Precision", f"{m.get('precision', 0)*100:.1f}%")
+        c4.metric("Recall",    f"{m.get('recall', 0)*100:.1f}%")

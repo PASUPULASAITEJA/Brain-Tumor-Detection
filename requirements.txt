@@ -1,5 +1,18 @@
+# Core deep learning
 tensorflow==2.16.1
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Scientific computing
 numpy==1.26.4
-pillow==10.0.0
-streamlit==1.35.0
-opencv-python==4.9.0.80
+scikit-learn>=1.4.0
+
+# Image processing
+pillow>=10.0.0
+opencv-python>=4.9.0.80
+
+# Web app
+streamlit>=1.35.0
+
+# Plotting (optional — for training curves)
+matplotlib>=3.8.0
