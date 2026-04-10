@@ -41,19 +41,19 @@ from rcnn_dataset import BrainTumorDetectionDataset
 ANNOTATIONS_PATH = "annotations/annotations.json"
 MODEL_SAVE_PATH  = "model/rcnn_model.pth"
 NUM_CLASSES      = 2          # 0=background, 1=tumor
-BATCH_SIZE       = 2
-EPOCHS           = 10
+BATCH_SIZE       = 4          # larger batches = fewer iterations
+EPOCHS           = 15
 LR_HEAD          = 0.005
 LR_BACKBONE      = 0.0005
 WEIGHT_DECAY     = 5e-4
 MOMENTUM         = 0.90
 VAL_SPLIT        = 0.15
 CONF_THRESHOLD   = 0.50       # threshold used in simple eval metric
+MAX_TRAIN_IMAGES = 800        # more data breaks the convergence plateau
 
-# Device preference: Apple Silicon → CUDA → CPU
-if torch.backends.mps.is_available():
-    DEVICE = torch.device("mps")
-elif torch.cuda.is_available():
+# Faster RCNN ops (NMS, ROI pooling) are not fully MPS-optimised and silently
+# fall back to CPU, causing MPS↔CPU transfer overhead.  Pure CPU is faster here.
+if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
 else:
     DEVICE = torch.device("cpu")
@@ -144,6 +144,13 @@ def train() -> None:
               "Check that generate_annotations.py ran successfully.")
         sys.exit(1)
 
+    # Cap total images so each epoch stays under ~2 min on CPU
+    if n_total > MAX_TRAIN_IMAGES:
+        indices = torch.randperm(n_total, generator=torch.Generator().manual_seed(42))
+        full_ds = torch.utils.data.Subset(full_ds, indices[:MAX_TRAIN_IMAGES].tolist())
+        n_total = MAX_TRAIN_IMAGES
+        print(f"Capped to        : {n_total} images (set MAX_TRAIN_IMAGES to use more)")
+
     n_val   = max(1, int(VAL_SPLIT * n_total))
     n_train = n_total - n_val
     train_ds, val_ds = random_split(
@@ -153,9 +160,11 @@ def train() -> None:
     print(f"Train / Val      : {n_train} / {n_val}")
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                              collate_fn=collate_fn, num_workers=0)
-    val_loader   = DataLoader(val_ds,   batch_size=1,          shuffle=False,
-                              collate_fn=collate_fn, num_workers=0)
+                              collate_fn=collate_fn, num_workers=2,
+                              persistent_workers=True)
+    val_loader   = DataLoader(val_ds,   batch_size=2,          shuffle=False,
+                              collate_fn=collate_fn, num_workers=2,
+                              persistent_workers=True)
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model = build_faster_rcnn(NUM_CLASSES).to(DEVICE)

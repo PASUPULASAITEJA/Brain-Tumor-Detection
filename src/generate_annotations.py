@@ -155,14 +155,41 @@ def generate_annotations() -> None:
         img_id += 1
         ann_id += 1
 
+    # ── Add negative (no-tumour) images — no bounding boxes ──────────────────
+    neg_dir   = Path(DATASET_PATH) / "no"
+    neg_paths = sorted(p for p in neg_dir.iterdir()
+                       if p.suffix.lower() in IMAGE_EXTS)
+    # Cap negatives to match annotated positives so dataset stays balanced
+    neg_paths = neg_paths[:ann_id]
+
+    print(f"Adding {len(neg_paths)} negative (no-tumour) images …")
+    for img_path in neg_paths:
+        try:
+            pil_img       = Image.open(img_path).convert("RGB")
+            orig_w, orig_h = pil_img.size
+        except Exception as e:
+            print(f"  [!] Cannot open {img_path.name}: {e}")
+            continue
+        # No annotation entry → RCNN will treat as background image
+        coco["images"].append({
+            "id":        img_id,
+            "file_name": str(img_path.resolve()),
+            "width":     orig_w,
+            "height":    orig_h,
+        })
+        img_id += 1
+
     # ── Save ──────────────────────────────────────────────────────────────────
     with open(ANNOTATIONS_PATH, "w") as f:
         json.dump(coco, f, indent=2)
 
+    total_images = ann_id + len(neg_paths)
     print(f"\n{'─'*50}")
-    print(f"Annotated : {ann_id} images")
-    print(f"Skipped   : {skipped} images (low confidence or no clear region)")
-    print(f"Saved     : {ANNOTATIONS_PATH}")
+    print(f"Tumour (positive) : {ann_id} images with boxes")
+    print(f"Normal (negative) : {len(neg_paths)} images (no boxes)")
+    print(f"Total             : {total_images}")
+    print(f"Skipped           : {skipped} (low confidence or no clear region)")
+    print(f"Saved             : {ANNOTATIONS_PATH}")
     print(f"\nNext step : python src/train_rcnn.py")
 
 

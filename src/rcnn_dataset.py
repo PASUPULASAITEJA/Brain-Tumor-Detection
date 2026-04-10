@@ -7,10 +7,12 @@ generate_annotations.py.
 Each item returns:
     img_tensor : FloatTensor (3, H, W)  — pixel values in [0, 1]
     target     : dict with keys boxes, labels, area, iscrowd, image_id
+
+Negative images (no tumour) have empty boxes/labels tensors, which is the
+correct way to pass background samples to Faster RCNN.
 """
 
 import json
-from pathlib import Path
 
 import torch
 from PIL import Image
@@ -37,11 +39,11 @@ class BrainTumorDetectionDataset(Dataset):
         for ann in data["annotations"]:
             ann_by_img.setdefault(ann["image_id"], []).append(ann)
 
-        # Keep only images that have at least one annotation
+        # Include ALL images — negatives have empty annotation lists so the
+        # RCNN learns to suppress false positives on normal scans
         self.samples: list[tuple[dict, list[dict]]] = [
-            (img_info, ann_by_img[img_info["id"]])
+            (img_info, ann_by_img.get(img_info["id"], []))
             for img_info in data["images"]
-            if img_info["id"] in ann_by_img
         ]
 
     # ── Dataset protocol ──────────────────────────────────────────────────────
@@ -73,15 +75,17 @@ class BrainTumorDetectionDataset(Dataset):
             boxes.append([x, y, x2, y2])
             labels.append(int(ann["category_id"]))
 
-        if not boxes:
-            # Edge case: return a dummy 1-pixel box so collate_fn doesn't fail
-            boxes  = [[0.0, 0.0, 1.0, 1.0]]
-            labels = [0]
+        # Empty tensors are valid for Faster RCNN background images
+        if boxes:
+            boxes_t  = torch.as_tensor(boxes,  dtype=torch.float32)
+            labels_t = torch.as_tensor(labels, dtype=torch.int64)
+            areas    = (boxes_t[:, 3] - boxes_t[:, 1]) * (boxes_t[:, 2] - boxes_t[:, 0])
+        else:
+            boxes_t  = torch.zeros((0, 4), dtype=torch.float32)
+            labels_t = torch.zeros(0,      dtype=torch.int64)
+            areas    = torch.zeros(0,      dtype=torch.float32)
 
-        boxes_t  = torch.as_tensor(boxes,  dtype=torch.float32)
-        labels_t = torch.as_tensor(labels, dtype=torch.int64)
-        areas    = (boxes_t[:, 3] - boxes_t[:, 1]) * (boxes_t[:, 2] - boxes_t[:, 0])
-        iscrowd  = torch.zeros(len(labels_t), dtype=torch.int64)
+        iscrowd = torch.zeros(len(labels_t), dtype=torch.int64)
 
         target = {
             "boxes":    boxes_t,
