@@ -158,26 +158,25 @@ def train() -> None:
     print("Test-set Evaluation")
     print("=" * 50)
 
-    results = model.evaluate(test_ds, verbose=1)
-    names   = model.metrics_names
-    metrics = dict(zip(names, results))
-    print("\nAll metrics:", metrics)
+    # Collect predictions for sklearn metrics (works across all Keras versions)
+    y_true, y_prob = [], []
+    for x_batch, y_batch in test_ds:
+        preds = model.predict(x_batch, verbose=0)
+        y_prob.extend(preds[:, 0].tolist())
+        y_true.extend(y_batch.numpy().astype(int).tolist())
 
-    acc  = metrics.get("accuracy",  metrics.get("acc",  results[1] if len(results)>1 else 0))
-    auc  = metrics.get("auc",  0)
-    prec = metrics.get("precision", 0)
-    rec  = metrics.get("recall",    0)
+    from sklearn.metrics import (accuracy_score, roc_auc_score,
+                                  precision_score, recall_score)
+    y_pred = [1 if p >= 0.5 else 0 for p in y_prob]
+    acc  = accuracy_score(y_true, y_pred)
+    auc  = roc_auc_score(y_true, y_prob)
+    prec = precision_score(y_true, y_pred, zero_division=0)
+    rec  = recall_score(y_true, y_pred, zero_division=0)
 
     print(f"Accuracy  : {acc*100:.2f}%")
     print(f"AUC       : {auc:.4f}")
     print(f"Precision : {prec*100:.2f}%")
     print(f"Recall    : {rec*100:.2f}%")
-
-    y_true, y_pred = [], []
-    for x_batch, y_batch in test_ds:
-        preds = model.predict(x_batch, verbose=0)
-        y_pred.extend((preds[:, 0] >= 0.5).astype(int).tolist())
-        y_true.extend(y_batch.numpy().astype(int).tolist())
 
     print("\nClassification Report:")
     print(classification_report(y_true, y_pred, target_names=["No Tumor", "Tumor"]))
@@ -185,7 +184,8 @@ def train() -> None:
     print(confusion_matrix(y_true, y_pred))
 
     with open(METRICS_PATH, "w") as f:
-        json.dump({k: float(v) for k, v in metrics.items()}, f, indent=2)
+        json.dump({"accuracy": acc, "auc": auc,
+                   "precision": prec, "recall": rec}, f, indent=2)
     print(f"\nMetrics saved → {METRICS_PATH}")
     print("Next step: python src/generate_annotations.py")
 
