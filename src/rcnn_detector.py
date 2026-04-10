@@ -18,7 +18,7 @@ from PIL import Image
 
 import torch
 import torchvision
-from torchvision.models.detection import fasterrcnn_resnet50_fpn
+from torchvision.models.detection import fasterrcnn_mobilenet_v3_large_320_fpn
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 import torchvision.transforms.functional as TVF
 
@@ -30,9 +30,7 @@ DEFAULT_MODEL_PATH  = "model/rcnn_model.pth"
 DEFAULT_CONF_THRESH = 0.50
 NUM_CLASSES         = 2        # background + tumor
 
-if torch.backends.mps.is_available():
-    _DEVICE = torch.device("mps")
-elif torch.cuda.is_available():
+if torch.cuda.is_available():
     _DEVICE = torch.device("cuda")
 else:
     _DEVICE = torch.device("cpu")
@@ -62,7 +60,7 @@ def load_rcnn_model(model_path: str = DEFAULT_MODEL_PATH,
     if not os.path.exists(model_path):
         return None
 
-    model = fasterrcnn_resnet50_fpn(weights=None)
+    model = fasterrcnn_mobilenet_v3_large_320_fpn(weights=None)
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, NUM_CLASSES)
 
